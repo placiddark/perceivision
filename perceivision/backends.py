@@ -18,8 +18,8 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-NebiusBaseURL = os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
-NemotronModel = os.environ.get("NEBIUS_MODEL", "nvidia/nemotron-3-ultra-80b")
+NebiusBaseURL = os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.us-central1.nebius.com/v1")
+NemotronModel = os.environ.get("NEBIUS_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 
 
 class Backend:
