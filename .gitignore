@@ -1,2 +1,7 @@
 perceivision/state/
 __pycache__/
+
+# secrets
+.env
+perceivision/state/
+__pycache__/

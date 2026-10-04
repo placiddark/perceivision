@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,6 +75,12 @@ class PerceivisionAgent:
         model_out = self.backend.chat(SYSTEM_PROMPT, messages)
         reply = model_out.get("reply", "")
 
+        # 3b. execute model-emitted directives (Nemotron emits JSON directives
+        #     like {"name": "clock", "args": {}} — honour them, never just echo)
+        executed = self._execute_directive(reply, trace)
+        if executed is not None:
+            reply = executed
+
         if handled:
             # direct op already produced the ground truth; model narrates it
             reply = f"{handled}\n{reply}"
@@ -90,6 +97,8 @@ class PerceivisionAgent:
             "direct_ops": trace,
             "model": model_out.get("model", "?"),
             "backend": model_out.get("backend", "?"),
+            "usage": model_out.get("usage", {}),
+            "latency_s": model_out.get("latency_s"),
         }
         with (STATE_DIR / "turns.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(turn_record, ensure_ascii=False) + "\n")
@@ -109,7 +118,18 @@ class PerceivisionAgent:
                 self.memory.remember_fact(key, value)
                 trace.append(f"memory.remember_fact({key!r})")
                 return f"[durable] remembered: {key} = {value}"
-            return None
+            # Natural-language form: "remember that X is Y" / "remember X is Y".
+            # Written deterministically here rather than delegated to the model,
+            # so a durable write never depends on the shape of model output.
+            clause = re.sub(r"^that\s+", "", body).strip().rstrip(".")
+            key, sep, value = clause.partition(" is ")
+            if sep:
+                self.memory.remember_fact(key.strip(), value.strip())
+                trace.append(f"memory.remember_fact({key.strip()!r})")
+                return f"[durable] remembered: {key.strip()} = {value.strip()}"
+            self.memory.remember_fact("note", clause)
+            trace.append("memory.remember_fact('note')")
+            return f"[durable] remembered note: {clause}"
 
         if low.startswith("open thread "):
             name = text[12:].strip()
@@ -140,6 +160,119 @@ class PerceivisionAgent:
             return "[tool] " + json.dumps(out.get("result", out), ensure_ascii=False)[:400]
 
         return None
+
+    # ── model-emitted directive execution (whitelist-gated) ─────────────────
+    #: Only these directive names may be dispatched. Anything else is ignored.
+    DIRECTIVE_ALLOWLIST = (
+        "clock",
+        "echo",
+        "memory-lookup",
+        "recall",
+        "skill-invoke",
+        "remember",
+    )
+
+    def _execute_directive(self, reply: str, trace: List[str]) -> Optional[str]:
+        """If the model emitted a JSON directive, run it and return real output.
+
+        Nemotron 3 Ultra answers tool-shaped turns with a JSON object rather
+        than prose. Echoing that JSON back to the user would be a fake tool
+        call, so it is parsed and executed instead. Strictly allowlisted:
+        the model can only reach tools the operator already granted.
+        """
+        if not reply:
+            return None
+        # models sometimes wrap the JSON in prose or a fenced block
+        start, end = reply.find("{"), reply.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            directive = json.loads(reply[start:end + 1])
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(directive, dict):
+            return None
+
+        name = directive.get("name") or directive.get("tool")
+
+        # Shape Nemotron emits for a bare memory write: {"facts": ["..."]}
+        # with no "name" key at all. Treated as a remember directive.
+        if name is None and isinstance(directive.get("facts"), list):
+            name = "remember"
+            directive = {"name": "remember", "args": directive["facts"]}
+
+        if name is None and isinstance(directive.get("operations"), list):
+            # Alternate directive shape Nemotron emits for memory writes:
+            #   {"operations": [{"op": "upsert_fact", "fact": "..."}, ...]}
+            applied = []
+            for operation in directive["operations"]:
+                if not isinstance(operation, dict):
+                    continue
+                op = operation.get("op") or operation.get("name")
+                fact = operation.get("fact") or operation.get("value") or operation.get("text")
+                if op in ("upsert_fact", "remember", "remember_fact") and fact:
+                    key, _, value = str(fact).partition(" is ")
+                    key = key.strip() or "note"
+                    self.memory.remember_fact(key, value.strip() or str(fact))
+                    applied.append(key)
+                elif op in ("open_thread", "open thread"):
+                    self.memory.open_thread(str(fact))
+                    applied.append(f"thread:{fact}")
+                else:
+                    trace.append(f"directive.op_rejected({op!r})")
+            if applied:
+                trace.append(f"memory.operations({applied!r})")
+                return "[durable] applied: " + "; ".join(applied)
+            return None
+
+        if name not in self.DIRECTIVE_ALLOWLIST:
+            trace.append(f"directive.rejected({name!r})")
+            return None
+
+        def _flatten(obj: Any) -> List[str]:
+            """Deep-flatten directive args into a flat list of strings."""
+            if obj is None:
+                return []
+            if isinstance(obj, str):
+                return [obj] if obj.strip() else []
+            if isinstance(obj, (int, float, bool)):
+                return [str(obj)]
+            if isinstance(obj, dict):
+                out: List[str] = []
+                for v in obj.values():
+                    out.extend(_flatten(v))
+                return out
+            if isinstance(obj, (list, tuple)):
+                out = []
+                for v in obj:
+                    out.extend(_flatten(v))
+                return out
+            return [str(obj)]
+
+        args = _flatten(directive.get("args"))
+
+        if name == "remember":
+            written = []
+            for fact in args:
+                key, _, value = fact.partition(" is ")
+                key = key.strip() or "note"
+                self.memory.remember_fact(key, value.strip() or fact)
+                written.append(key)
+            trace.append(f"memory.remember_fact({written!r})")
+            return "[durable] remembered: " + "; ".join(written)
+
+        if name == "recall":
+            name = "memory-lookup"
+
+        out = self.tools.call(
+            name, *args, ctx={"memory": self.memory, "skills": self.skills}
+        )
+        trace.append(f"tools.call({name!r})")
+        if not out.get("ok", True):
+            return f"[tool:{name}] failed: {out.get('error')}"
+        return "[tool:" + name + "] " + json.dumps(
+            out.get("result", out), ensure_ascii=False, default=str
+        )[:400]
 
     # ── introspection ────────────────────────────────────────────────────────
     def status(self) -> Dict[str, Any]:

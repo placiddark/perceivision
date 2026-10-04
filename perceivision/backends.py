@@ -19,7 +19,9 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 NebiusBaseURL = os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.us-central1.nebius.com/v1")
-NemotronModel = os.environ.get("NEBIUS_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+# Model ID verified live against Token Factory /models on 2026-10-04 (key present).
+# Casing matters: the served ID is "Nemotron-3-Ultra", not "nemotron-3-ultra".
+NemotronModel = os.environ.get("NEBIUS_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
 
 
 class Backend:
@@ -76,15 +78,8 @@ class NebiusBackend(Backend):
     def available(self) -> bool:
         return bool(self.api_key)
 
-    def chat(self, system: str, messages: List[Dict[str, str]], **kw: Any) -> Dict[str, Any]:
-        if not self.api_key:
-            raise RuntimeError("NEBIUS_API_KEY not set — Builder Program credits pending")
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system}] + messages,
-            **kw,
-        }
-        req = urllib.request.Request(
+    def _build_request(self, payload: Dict[str, Any]) -> urllib.request.Request:
+        return urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={
@@ -93,15 +88,47 @@ class NebiusBackend(Backend):
             },
             method="POST",
         )
+
+    def chat(self, system: str, messages: List[Dict[str, str]], **kw: Any) -> Dict[str, Any]:
+        if not self.api_key:
+            raise RuntimeError("NEBIUS_API_KEY not set - Builder Program credits pending")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}] + messages,
+            **kw,
+        }
         started = time.time()
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        reply = body["choices"][0]["message"]["content"]
+        last_message: Dict[str, Any] = {}
+        last_usage: Dict[str, Any] = {}
+        reply = ""
+        # Nemotron 3 Ultra intermittently spends the whole turn in reasoning and
+        # returns content=null. Retry before falling back — a null content must
+        # never be silently replaced by prose from the reasoning trace.
+        for attempt in range(3):
+            with urllib.request.urlopen(self._build_request(payload), timeout=60) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            last_message = body["choices"][0]["message"]
+            last_usage = body.get("usage", {}) or {}
+            reply = last_message.get("content") or ""
+            if reply:
+                break
+            # nudge the model back into answering rather than only reasoning
+            payload["messages"] = payload["messages"] + [
+                {
+                    "role": "user",
+                    "content": "Answer now. If this turn needs a tool or a memory "
+                    "write, reply with the JSON directive only.",
+                }
+            ]
+        if not reply:
+            reply = last_message.get("reasoning_content") or ""
+        if not reply:
+            raise RuntimeError("empty completion from Token Factory after 3 attempts")
         return {
             "backend": "nebius",
             "model": self.model,
             "reply": reply,
-            "usage": body.get("usage", {}),
+            "usage": last_usage,
             "latency_s": round(time.time() - started, 2),
         }
 
